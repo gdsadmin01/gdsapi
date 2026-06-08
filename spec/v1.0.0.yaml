@@ -1,0 +1,1500 @@
+openapi: 3.1.0
+
+info:
+  title: GDSMaster Agent API
+  version: 1.0.0
+  description: |
+    Agent-facing REST API for GDSMaster. Enables programmatic order creation,
+    document management, quote reservation, and webhook event subscriptions.
+
+    ## Authentication
+
+    Every request must include three headers:
+
+    | Header | Description |
+    |---|---|
+    | `x-api-key` | Your API key (`gds_agt_` prefix) |
+    | `x-timestamp` | Unix timestamp in seconds (within ±300 s of server time) |
+    | `x-signature` | HMAC-SHA256 signature of the canonical request string (hex) |
+
+    ### Computing the signature
+
+    1. Compute `body_hash = SHA256(raw_request_body_bytes)` as lowercase hex.
+       For requests with no body (GET, DELETE), use `SHA256("")`.
+    2. Build the canonical string (newline-separated):
+       ```
+       METHOD\nPATHNAME\nTIMESTAMP\nbody_hash
+       ```
+       Example: `POST\n/api/v1/orders\n1717600000\ne3b0c44298fc1c149afb...`
+    3. Compute `HMAC-SHA256(canonical_string, hmac_secret)` and encode as lowercase hex.
+    4. Set `x-signature` to the hex digest. A `sha256=` prefix is also accepted.
+
+    The HMAC secret is provided once when the API key is issued and cannot be retrieved afterwards.
+
+    > **Multipart note:** For `POST /api/v1/documents` (multipart/form-data), compute the
+    > signature against an empty body — use `SHA256("")` regardless of actual file content.
+
+    ## Order Lifecycle
+
+    ```
+    N → R → U → P → D
+               ↘ F (failed — terminal, submit a new order)
+    N / R / U → C (cancelled)
+    ```
+
+    | Status | Meaning |
+    |---|---|
+    | `N` | New — draft created |
+    | `R` | Submitted — processing reserved |
+    | `U` | Order created — awaiting payment |
+    | `P` | Payment received — processing in progress |
+    | `D` | Delivered — completed |
+    | `F` | Failed — terminal |
+    | `C` | Cancelled |
+
+    ## Error Format
+
+    All error responses use this shape:
+    ```json
+    { "error": "ERROR_CODE", "message": "Human-readable description." }
+    ```
+
+    ### Common auth error codes
+
+    | Code | Status | Cause |
+    |---|---|---|
+    | `KEY_INVALID` | 401 | Missing, malformed, or incorrect API key |
+    | `TIMESTAMP_EXPIRED` | 401 | Timestamp outside ±300 s window |
+    | `SIGNATURE_INVALID` | 401 | HMAC signature mismatch |
+    | `KEY_REVOKED` | 401 | Key has been revoked or has expired |
+
+servers:
+  - url: https://api.geodesiq.co
+    description: Production
+
+tags:
+  - name: System
+    description: Health and connectivity
+  - name: Config
+    description: Agent-scoped configuration — payment methods, purposes, and institutions
+  - name: Rates
+    description: Exchange rates
+  - name: Clients
+    description: Client lookup
+  - name: Documents
+    description: Document pre-upload (KYC and order documents)
+  - name: Quotes
+    description: Quote reservation (rate lock)
+  - name: Orders
+    description: Order creation and management
+  - name: Webhooks
+    description: Webhook subscription management
+
+security:
+  - ApiKey: []
+    Timestamp: []
+    Signature: []
+
+components:
+  securitySchemes:
+    ApiKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: API key issued by GDSMaster (`gds_agt_` prefix followed by 16 chars)
+    Timestamp:
+      type: apiKey
+      in: header
+      name: x-timestamp
+      description: Unix timestamp in seconds. Must be within ±300 s of server time.
+    Signature:
+      type: apiKey
+      in: header
+      name: x-signature
+      description: HMAC-SHA256 of the canonical request string, lowercase hex.
+
+  responses:
+    Unauthorized:
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            key_invalid:
+              summary: Missing or invalid key
+              value: { error: KEY_INVALID, message: Invalid API key. }
+            timestamp_expired:
+              summary: Clock skew too large
+              value: { error: TIMESTAMP_EXPIRED, message: Request timestamp is outside the ±300 s allowed window. }
+            signature_invalid:
+              summary: HMAC mismatch
+              value: { error: SIGNATURE_INVALID, message: Request signature is invalid. }
+
+  schemas:
+
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          example: INVALID_REQUEST
+        message:
+          type: string
+          example: Human-readable description.
+
+    OrderStatus:
+      type: string
+      enum: [N, R, U, P, D, F, C]
+      description: |
+        Order lifecycle status — see the Order Lifecycle table in the API overview.
+
+    Client:
+      type: object
+      required: [id, name, email, phone_country, phone_num, nationality, id_type, id_num, payment_reference]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        phone_country:
+          type: string
+          description: International dial code (e.g. `+60`, `+86`)
+          example: "+60"
+        phone_num:
+          type: string
+          maxLength: 20
+        nationality:
+          type: string
+          minLength: 2
+          maxLength: 2
+          description: ISO 3166-1 alpha-2 country code
+          example: CN
+        id_type:
+          type: string
+          description: ID document type (e.g. `idcard`, `passport`)
+          example: idcard
+        id_num:
+          type: string
+        payment_reference:
+          type: string
+          maxLength: 100
+          description: Institution payment reference stored on the client record
+
+    PaymentDetails:
+      type: object
+      properties:
+        bank_name:
+          type: [string, "null"]
+        account_name:
+          type: [string, "null"]
+        account_number:
+          type: [string, "null"]
+        reference:
+          type: [string, "null"]
+
+    OrderDocument:
+      type: object
+      required: [doc_id, doc_type]
+      properties:
+        doc_id:
+          type: string
+          format: uuid
+        doc_type:
+          type: string
+          enum: [PP, IF, IB, OF, IV]
+          description: |
+            - `PP` — Passport
+            - `IF` — ID card front
+            - `IB` — ID card back
+            - `OF` — Offer letter
+            - `IV` — Invoice
+        original_filename:
+          type: [string, "null"]
+
+    OrderSummary:
+      type: object
+      required: [order_id, order_no, req_country, req_amount, req_currency, payment_currency, status, client_name, created_at]
+      properties:
+        order_id:
+          type: string
+          format: uuid
+        order_no:
+          type: string
+        req_country:
+          type: string
+          minLength: 2
+          maxLength: 2
+        req_amount:
+          type: string
+          example: "5000.00"
+        req_currency:
+          type: string
+          example: MYR
+        payment_amount:
+          type: [string, "null"]
+        payment_currency:
+          type: string
+          example: CNY
+        payment_method:
+          type: [string, "null"]
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        client_name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    OrderDetail:
+      type: object
+      required: [order_id, order_no, status, req_country, req_amount, req_currency, payment_currency, payment_details, client, documents, created_at]
+      properties:
+        order_id:
+          type: string
+          format: uuid
+        order_no:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        req_country:
+          type: string
+          minLength: 2
+          maxLength: 2
+        req_amount:
+          type: string
+        req_currency:
+          type: string
+        req_desc:
+          type: [string, "null"]
+        payment_amount:
+          type: [string, "null"]
+        payment_currency:
+          type: string
+        ex_rate:
+          type: [string, "null"]
+          description: Exchange rate to 8 decimal places
+        payment_method:
+          type: [string, "null"]
+        payer_relation:
+          type: [string, "null"]
+        realpayer_name:
+          type: [string, "null"]
+        realpayer_id_type:
+          type: [string, "null"]
+        realpayer_id_num:
+          type: [string, "null"]
+        payment_details:
+          $ref: '#/components/schemas/PaymentDetails'
+        client:
+          $ref: '#/components/schemas/Client'
+        documents:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderDocument'
+        created_at:
+          type: string
+          format: date-time
+
+    WebhookSubscription:
+      type: object
+      required: [webhook_id, url, events, is_active, failure_count, created_at]
+      properties:
+        webhook_id:
+          type: string
+          format: uuid
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+            enum: [order.paid, order.delivered, order.failed, order.cancelled]
+        is_active:
+          type: boolean
+        failure_count:
+          type: integer
+          description: Number of consecutive delivery failures
+        created_at:
+          type: string
+          format: date-time
+        last_fired_at:
+          type: [string, "null"]
+          format: date-time
+
+paths:
+
+  # ── System ──────────────────────────────────────────────────────────────────
+
+  /api/v1/ping:
+    get:
+      tags: [System]
+      summary: Health check
+      description: Verifies that authentication is working and returns the authenticated agent ID.
+      operationId: ping
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, agent_id]
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  agent_id:
+                    type: string
+                    format: uuid
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ── Rates ───────────────────────────────────────────────────────────────────
+
+  /api/v1/rates:
+    get:
+      tags: [Rates]
+      summary: Get exchange rates
+      description: |
+        Returns the latest exchange rate(s) against the base currency (`req_currency`, default `MYR`).
+
+        - If `payment_currency` is supplied → returns a single rate object.
+        - If omitted → returns a map of all available currencies.
+      operationId: getRates
+      parameters:
+        - name: payment_currency
+          in: query
+          required: false
+          schema:
+            type: string
+          example: CNY
+          description: ISO 4217 payment currency code. Omit to return all available rates.
+        - name: req_currency
+          in: query
+          required: false
+          schema:
+            type: string
+            default: MYR
+          example: MYR
+          description: Base (request) currency. Defaults to `MYR`.
+      responses:
+        '200':
+          description: Exchange rate(s)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - title: Single rate
+                    description: Returned when `payment_currency` is specified
+                    type: object
+                    required: [updated_at, payment_currency, req_currency, ex_rate]
+                    properties:
+                      updated_at:
+                        type: string
+                        format: date-time
+                      payment_currency:
+                        type: string
+                      req_currency:
+                        type: string
+                      ex_rate:
+                        type: string
+                        description: Rate to 8 decimal places
+                        example: "2.14320000"
+                  - title: All rates
+                    description: Returned when `payment_currency` is omitted
+                    type: object
+                    required: [updated_at, req_currency, rates]
+                    properties:
+                      updated_at:
+                        type: string
+                        format: date-time
+                      req_currency:
+                        type: string
+                      rates:
+                        type: object
+                        additionalProperties:
+                          type: string
+                        description: Map of currency code → rate (8 decimal places)
+                        example:
+                          CNY: "2.14320000"
+                          JPY: "0.02910000"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Currency not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: No exchange rate data available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ── Config ──────────────────────────────────────────────────────────────────
+
+  /api/v1/config/payment-methods:
+    get:
+      tags: [Config]
+      summary: List payment methods
+      description: Returns payment methods enabled for this agent, including fee and amount limit details.
+      operationId: listPaymentMethods
+      parameters:
+        - name: country_code
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+          example: CN
+          description: Filter results to a specific destination country.
+      responses:
+        '200':
+          description: Available payment methods
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [payment_code, payment_desc]
+                      properties:
+                        payment_code:
+                          type: string
+                          example: WECHAT
+                        payment_desc:
+                          type: string
+                          example: WeChat Pay
+                        fee_rate:
+                          type: [string, "null"]
+                          description: Percentage fee as a decimal (e.g. `"0.0100"` = 1%)
+                        fee_amount:
+                          type: [string, "null"]
+                          description: Fixed fee in the payment currency
+                        min_req_amount:
+                          type: [number, "null"]
+                        max_req_amount:
+                          type: [number, "null"]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/config/payment-purposes:
+    get:
+      tags: [Config]
+      summary: List payment purposes
+      description: Returns payment purposes accessible to this agent.
+      operationId: listPaymentPurposes
+      parameters:
+        - name: country_code
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+          example: CN
+          description: Filter results to a specific destination country.
+      responses:
+        '200':
+          description: Available payment purposes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, purpose_code, purpose_desc, country_code, is_personal]
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        purpose_code:
+                          type: string
+                        purpose_desc:
+                          type: string
+                        country_code:
+                          type: string
+                          minLength: 2
+                          maxLength: 2
+                        is_personal:
+                          type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/config/institutions:
+    get:
+      tags: [Config]
+      summary: List institutions
+      description: |
+        Returns institutions accessible to this agent. Use `purpose_id` to filter
+        to institutions relevant to a specific payment purpose.
+      operationId: listInstitutions
+      parameters:
+        - name: purpose_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+          description: Filter by payment purpose ID.
+      responses:
+        '200':
+          description: Available institutions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, comp_name]
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        comp_name:
+                          type: string
+                        display_name:
+                          type: [string, "null"]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ── Clients ─────────────────────────────────────────────────────────────────
+
+  /api/v1/clients:
+    get:
+      tags: [Clients]
+      summary: Look up client by ID document
+      description: |
+        Searches for a client by `id_type` + `id_num`. Only returns clients this agent
+        has a prior order with.
+      operationId: lookupClient
+      parameters:
+        - name: id_type
+          in: query
+          required: true
+          schema:
+            type: string
+          example: idcard
+          description: ID document type (e.g. `idcard`, `passport`).
+        - name: id_num
+          in: query
+          required: true
+          schema:
+            type: string
+          example: "110101199001011234"
+          description: ID document number.
+      responses:
+        '200':
+          description: Client found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Client'
+        '400':
+          description: Missing `id_type` or `id_num` query parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Client not found or not accessible to this agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/clients/{client_id}:
+    get:
+      tags: [Clients]
+      summary: Get client by ID
+      description: |
+        Returns a client record by UUID. Only accessible if this agent has a prior order
+        with the client. The `client_id` is returned in the `POST /api/v1/orders` response.
+      operationId: getClient
+      parameters:
+        - name: client_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Client found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Client'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Client not found or not accessible to this agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ── Documents ───────────────────────────────────────────────────────────────
+
+  /api/v1/documents:
+    post:
+      tags: [Documents]
+      summary: Upload a document
+      description: |
+        Uploads a KYC or order document. Accepted formats: JPG, JPEG, PNG, PDF.
+        File content is validated against the declared extension — mismatches are rejected.
+
+        **Document types:**
+
+        | Type | Description | `client_id` required |
+        |---|---|---|
+        | `PP` | Passport | Yes |
+        | `IF` | ID card (front) | Yes |
+        | `IB` | ID card (back) | Yes |
+        | `OF` | Offer letter | No |
+        | `IV` | Invoice | No |
+
+        The `doc_id` returned for `OF`/`IV` documents is what you supply as `doc_ids` in
+        `POST /api/v1/orders`. KYC documents (`PP`, `IF`, `IB`) are linked to a client and
+        uploaded to the payment gateway automatically.
+
+        The gateway pre-upload runs asynchronously — a `201` response confirms the file was
+        saved, not that the gateway upload completed. Gateway upload status is visible through
+        the order's document list after order creation.
+
+        > **Signature note:** Compute `x-signature` against an empty body (`SHA256("")`).
+        > Do not include the raw multipart bytes in the canonical string.
+      operationId: uploadDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [doc_type, file]
+              properties:
+                doc_type:
+                  type: string
+                  enum: [PP, IF, IB, OF, IV]
+                client_id:
+                  type: string
+                  format: uuid
+                  description: Required for KYC document types (PP, IF, IB).
+                file:
+                  type: string
+                  format: binary
+                  description: File to upload. Max size determined by server config (default 50 MB).
+      responses:
+        '201':
+          description: Document uploaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [doc_id, doc_type]
+                properties:
+                  doc_id:
+                    type: string
+                    format: uuid
+                  doc_type:
+                    type: string
+                    enum: [PP, IF, IB, OF, IV]
+        '400':
+          description: Invalid request — missing field, invalid doc_type, unsupported format, or file too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: client_id not found or no prior orders with this agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ── Quotes ──────────────────────────────────────────────────────────────────
+
+  /api/v1/quotes:
+    post:
+      tags: [Quotes]
+      summary: Create a quote
+      description: |
+        Reserves an exchange rate and fee for a given amount and payment method.
+        The quote expires after the configured validity period (default 600 s).
+
+        A quote can only be used once — passing it to `POST /api/v1/orders` marks it as consumed.
+        Request a new quote if it has expired or was already used.
+      operationId: createQuote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [payment_method_code, payment_purpose_id, req_amount, req_country]
+              properties:
+                payment_method_code:
+                  type: string
+                  description: From `GET /api/v1/config/payment-methods`
+                  example: WECHAT
+                payment_purpose_id:
+                  type: string
+                  format: uuid
+                  description: From `GET /api/v1/config/payment-purposes`
+                institution_id:
+                  type: string
+                  format: uuid
+                  description: From `GET /api/v1/config/institutions`. Required for institution-linked transfers.
+                req_amount:
+                  type: string
+                  description: Amount to remit in `req_currency` (MYR). Must be greater than zero.
+                  example: "5000.00"
+                req_country:
+                  type: string
+                  minLength: 2
+                  maxLength: 2
+                  description: ISO 3166-1 alpha-2 destination country code
+                  example: CN
+      responses:
+        '201':
+          description: Quote created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [quote_id, payment_method_code, req_country, req_amount, req_currency, payment_currency, ex_rate, payment_amount, expires_at, validity_seconds]
+                properties:
+                  quote_id:
+                    type: string
+                    format: uuid
+                  payment_method_code:
+                    type: string
+                  req_country:
+                    type: string
+                  req_amount:
+                    type: string
+                  req_currency:
+                    type: string
+                    example: MYR
+                  payment_currency:
+                    type: string
+                    example: CNY
+                  ex_rate:
+                    type: string
+                    description: Locked exchange rate to 8 decimal places
+                    example: "2.14320000"
+                  payment_amount:
+                    type: string
+                    description: Total amount the client pays in `payment_currency` (includes fees)
+                    example: "10920.00"
+                  expires_at:
+                    type: string
+                    format: date-time
+                  validity_seconds:
+                    type: integer
+                    example: 600
+        '400':
+          description: Invalid request — missing field, invalid amount, or payment method/purpose not available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Exchange rate data is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/quotes/{quote_id}:
+    get:
+      tags: [Quotes]
+      summary: Get a quote
+      description: Returns the current state of a quote reservation.
+      operationId: getQuote
+      parameters:
+        - name: quote_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Quote found
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [quote_id, status, payment_method_code, req_country, req_amount, req_currency, payment_currency, ex_rate, payment_amount, expires_at, used_at, created_at]
+                properties:
+                  quote_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [active, expired, used]
+                  payment_method_code:
+                    type: string
+                  req_country:
+                    type: string
+                  req_amount:
+                    type: string
+                  req_currency:
+                    type: string
+                  payment_currency:
+                    type: string
+                  ex_rate:
+                    type: string
+                  payment_amount:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+                  used_at:
+                    type: [string, "null"]
+                    format: date-time
+                  created_at:
+                    type: string
+                    format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Quote not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ── Orders ──────────────────────────────────────────────────────────────────
+
+  /api/v1/orders:
+    get:
+      tags: [Orders]
+      summary: List orders
+      description: Returns a paginated list of this agent's orders, newest first.
+      operationId: listOrders
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+          description: Filter by order status.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Number of records to return. Max 100.
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Number of records to skip for pagination.
+      responses:
+        '200':
+          description: Paginated order list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, total, limit, offset]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrderSummary'
+                  total:
+                    type: integer
+                    description: Total matching records (ignores limit/offset)
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Orders]
+      summary: Create an order
+      description: |
+        Creates a remittance order. The body follows one of two mutually exclusive forms —
+        supplying fields from both, or from neither, is rejected with `400`.
+
+        **Form A — existing client** (`client_id` only):
+        The client must have at least one prior order with this agent.
+        `payment_reference` is updated on the client record.
+
+        **Form B — new or returning client** (identity fields):
+        The client is matched by `id_type + id_num`. If found, their contact details and
+        `payment_reference` are updated. If not found, a new client record is created.
+
+        ### Processing steps
+
+        1. Quote validated — must be active (not used, not expired).
+        2. Client resolved / upserted.
+        3. `doc_ids` validated — must contain at least one `OF` and one `IV`, owned by this agent, not yet linked to another order.
+        4. DB transaction — order created (`N → R`), quote consumed, documents linked.
+        5. All client KYC files and order documents are uploaded to the payment gateway in parallel.
+        6. `xcCreateOrder` called — on success the order advances to `U`; on failure the order is set to `F` (terminal).
+
+        A `201` response with `status: U` means the order is active and awaiting payment.
+        A `422` response means the order was created but failed at the gateway — it is terminal at `F`.
+        Submit a new order to retry.
+      operationId: createOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quote_id, payment_reference, payer_relation, doc_ids]
+              properties:
+                client_id:
+                  type: string
+                  format: uuid
+                  description: "**Form A.** Existing client UUID returned from a previous order."
+                id_type:
+                  type: string
+                  description: "**Form B.** ID document type. Allowed values from `ID_TYPES` server config."
+                  example: idcard
+                id_num:
+                  type: string
+                  description: "**Form B.** ID document number."
+                client_name:
+                  type: string
+                  description: "**Form B.** Client full name."
+                client_email:
+                  type: string
+                  format: email
+                  description: "**Form B.** Client email address."
+                client_phone_country:
+                  type: string
+                  description: "**Form B.** International dial code (e.g. `+60`)."
+                  example: "+60"
+                client_phone_num:
+                  type: string
+                  maxLength: 20
+                  description: "**Form B.** Phone number digits, max 20 characters."
+                nationality:
+                  type: string
+                  minLength: 2
+                  maxLength: 2
+                  description: "**Form B.** ISO 3166-1 alpha-2 country code. Allowed values from `COUNTRY_MAP` server config."
+                  example: CN
+                quote_id:
+                  type: string
+                  format: uuid
+                  description: Active quote from `POST /api/v1/quotes`. Must not be used or expired.
+                payment_reference:
+                  type: string
+                  maxLength: 100
+                  description: Institution payment reference. Stored on the client record.
+                req_desc:
+                  type: string
+                  description: Optional free-text order description.
+                payer_relation:
+                  type: string
+                  description: |
+                    Relationship of the account holder to the client.
+                    Allowed values from `PAYER_RELATIONSHIPS` server config (e.g. `Self`, `Parent`, `Spouse`).
+                  example: Self
+                realpayer_name:
+                  type: string
+                  description: Account holder full name. Required when `payer_relation` is not `Self`.
+                realpayer_id_type:
+                  type: string
+                  description: Account holder ID type. Required when `payer_relation` is not `Self`. Allowed values from `FULL_ID_TYPES` server config.
+                realpayer_id_num:
+                  type: string
+                  description: Account holder ID number. Required when `payer_relation` is not `Self`.
+                doc_ids:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                    format: uuid
+                  description: |
+                    Document IDs from `POST /api/v1/documents`. Must include at least one `OF`
+                    (offer letter) and one `IV` (invoice). Documents must be unlinked and owned
+                    by this agent.
+      responses:
+        '201':
+          description: Order created and submitted to payment gateway (status `U`)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order_id, client_id, order_no, status, req_amount, req_currency, payment_currency, payment_amount, ex_rate, payment_details]
+                properties:
+                  order_id:
+                    type: string
+                    format: uuid
+                  client_id:
+                    type: string
+                    format: uuid
+                  order_no:
+                    type: string
+                  status:
+                    type: string
+                    enum: [U]
+                  req_amount:
+                    type: string
+                  req_currency:
+                    type: string
+                  payment_currency:
+                    type: string
+                  payment_amount:
+                    type: string
+                  ex_rate:
+                    type: string
+                  payment_details:
+                    $ref: '#/components/schemas/PaymentDetails'
+                  warnings:
+                    type: array
+                    items:
+                      type: string
+                    description: Non-fatal warnings, e.g. individual file upload failures to the gateway. The order itself is still active.
+        '400':
+          description: Validation error (missing field, invalid value, XOR form violation, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: A document does not belong to this agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Quote, client, or document not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Quote already used, quote expired, or a document was claimed by a concurrent request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: |
+            Order was created in the database but was rejected by the payment gateway.
+            The order status is set to `F` (terminal). Do not retry the same request —
+            submit a new order with corrected data.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, message, order_id, order_no, client_id, status]
+                properties:
+                  error:
+                    type: string
+                    enum: [XC_FILES_NOT_READY, XC_ORDER_FAILED]
+                    description: |
+                      - `XC_FILES_NOT_READY` — No documents were successfully pre-uploaded to the gateway before order submission.
+                      - `XC_ORDER_FAILED` — The gateway rejected the order creation request.
+                  message:
+                    type: string
+                  order_id:
+                    type: string
+                    format: uuid
+                  order_no:
+                    type: string
+                  client_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [F]
+
+  /api/v1/orders/{order_id}:
+    get:
+      tags: [Orders]
+      summary: Get order detail
+      description: Returns full detail for a single order including client info and linked documents.
+      operationId: getOrder
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Order detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Order not found or not owned by this agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/orders/{order_id}/cancel:
+    post:
+      tags: [Orders]
+      summary: Cancel an order
+      description: |
+        Cancels an order. Only orders in status `N`, `R`, or `U` can be cancelled.
+        Orders in status `P`, `D`, `F`, or `C` cannot be cancelled.
+      operationId: cancelOrder
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Order cancelled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order_id, status]
+                properties:
+                  order_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [C]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Order not found or not owned by this agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Order is in a non-cancellable state (P, D, F, or already C)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    properties:
+                      error:
+                        type: string
+                        enum: [INVALID_STATE]
+
+  /api/v1/orders/{order_id}/documents/CB/download:
+    get:
+      tags: [Orders]
+      summary: Download cross-border payment note (PDF)
+      description: |
+        Returns a generated cross-border payment note PDF.
+        Available only when the order status is `P` or `D`.
+      operationId: downloadCrossBorderNote
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: PDF file
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              example: attachment; filename="CB_ORD123456.pdf"
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Order not found, or order status is not P or D
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/orders/{order_id}/documents/PC/download:
+    get:
+      tags: [Orders]
+      summary: Download payment confirmation receipt (PDF)
+      description: |
+        Returns a generated payment confirmation receipt PDF.
+        Available only when the order status is `D` (delivered).
+      operationId: downloadPaymentConfirmation
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: PDF file
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              example: attachment; filename="PC_ORD123456.pdf"
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Order not found, or order status is not D
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/orders/{order_id}/documents/{doc_type}/download:
+    get:
+      tags: [Orders]
+      summary: Download an order document
+      description: |
+        Downloads a raw document file attached to an order.
+
+        For generated PDFs use the dedicated endpoints instead:
+        - `GET /api/v1/orders/{order_id}/documents/CB/download` — cross-border payment note
+        - `GET /api/v1/orders/{order_id}/documents/PC/download` — payment confirmation receipt
+      operationId: downloadOrderDocument
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: doc_type
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [PP, IF, IB, OF, IV]
+          description: Document type to download.
+      responses:
+        '200':
+          description: File content
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              example: attachment; filename="offer_letter.pdf"
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid doc_type value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Document not found or file missing on disk
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ── Webhooks ─────────────────────────────────────────────────────────────────
+
+  /api/v1/webhooks:
+    get:
+      tags: [Webhooks]
+      summary: List webhook subscriptions
+      description: Returns all webhook subscriptions for this agent, including inactive ones.
+      operationId: listWebhooks
+      responses:
+        '200':
+          description: Webhook subscription list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WebhookSubscription'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Webhooks]
+      summary: Register a webhook
+      description: |
+        Registers a webhook endpoint. Any existing active subscriptions for this agent are
+        deactivated first — only one active subscription is maintained at a time.
+
+        ### Payload format
+
+        GDSMaster will `POST` the following JSON to your endpoint when a subscribed event fires:
+
+        ```json
+        {
+          "event": "order.paid",
+          "order_id": "...",
+          "order_no": "...",
+          "status": "P",
+          "fired_at": "2026-01-01T00:00:00.000Z"
+        }
+        ```
+
+        ### Verifying delivery
+
+        Each delivery includes an `X-Webhook-Signature: sha256=<hex>` header.
+        Verify it by computing `HMAC-SHA256(raw_payload_bytes, webhook_secret)` and comparing
+        with the header value. The `secret` is returned only at registration time.
+
+        ### Secret handling
+
+        The `secret` in the `201` response is shown **once only** — store it securely.
+        If lost, deactivate the subscription and register a new one.
+      operationId: registerWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, events]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  description: HTTPS endpoint to receive events. Must start with `https://`. Max 500 characters.
+                  example: https://your-server.com/webhooks/gds
+                events:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                    enum: [order.paid, order.delivered, order.failed, order.cancelled]
+                  description: |
+                    Event types to subscribe to:
+                    - `order.paid` — Payment received (order status → `P`)
+                    - `order.delivered` — Order delivered (order status → `D`)
+                    - `order.failed` — Order failed (order status → `F`)
+                    - `order.cancelled` — Order cancelled (order status → `C`)
+      responses:
+        '201':
+          description: Webhook registered
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [webhook_id, url, events, secret]
+                properties:
+                  webhook_id:
+                    type: string
+                    format: uuid
+                  url:
+                    type: string
+                    format: uri
+                  events:
+                    type: array
+                    items:
+                      type: string
+                  secret:
+                    type: string
+                    description: Base64-encoded HMAC signing secret. Shown once — store securely.
+        '400':
+          description: Invalid URL or event names
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/webhooks/{webhook_id}:
+    delete:
+      tags: [Webhooks]
+      summary: Deactivate a webhook
+      description: Deactivates a webhook subscription. The record is retained for audit purposes.
+      operationId: deactivateWebhook
+      parameters:
+        - name: webhook_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Webhook deactivated (no response body)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Webhook not found or not owned by this agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
