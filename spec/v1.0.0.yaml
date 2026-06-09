@@ -457,7 +457,7 @@ paths:
             minLength: 2
             maxLength: 2
           example: CN
-          description: Filter results to a specific destination country.
+          description: Filter results to a specific destination country. Must be a supported country code.
       responses:
         '200':
           description: Available payment methods
@@ -471,7 +471,7 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [payment_code, payment_desc]
+                      required: [payment_code, payment_desc, country_code, fee_currency, min_max_currency]
                       properties:
                         payment_code:
                           type: string
@@ -479,16 +479,40 @@ paths:
                         payment_desc:
                           type: string
                           example: WeChat Pay
+                        country_code:
+                          type: string
+                          minLength: 2
+                          maxLength: 2
+                          description: ISO 3166-1 alpha-2 destination country code
+                          example: CN
                         fee_rate:
                           type: [string, "null"]
-                          description: Percentage fee as a decimal (e.g. `"0.0100"` = 1%)
+                          description: Percentage fee formatted as a string (e.g. `"1.00%"`)
+                          example: "1.00%"
                         fee_amount:
                           type: [string, "null"]
-                          description: Fixed fee in the payment currency
+                          description: Fixed fee amount in `fee_currency`
+                        fee_currency:
+                          type: string
+                          description: Currency code for `fee_amount` (e.g. `CNY`)
+                          example: CNY
                         min_req_amount:
                           type: [number, "null"]
                         max_req_amount:
                           type: [number, "null"]
+                        min_max_currency:
+                          type: string
+                          description: Currency code for `min_req_amount` / `max_req_amount` (derived from destination country)
+                          example: CNY
+        '400':
+          description: Unsupported `country_code` value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: INVALID_REQUEST
+                message: Country code XX is not supported.
         '401':
           $ref: '#/components/responses/Unauthorized'
 
